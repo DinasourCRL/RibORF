@@ -1,0 +1,185 @@
+# This is an analysis pipline for Ribosome profiling data.
+# Reference paper：Ji, Z. (2018). RibORF: Identifying genome-wide translated open reading frames using ribosome profiling. Current Protocols in Molecular Biology, e67. doi: 10.1002/cpmb.67
+# Last modified: 2023.11.6
+
+############################################### background ######################################################
+# Based on read distribution features representing active translation, including 3-nt periodicity and uniformness across codons 周期性 & 保守性
+# 从Rib profiling建库流程来看，用RNase I消化所有不被蛋白保护的RNA，那么没被消化的就是有蛋白保护；
+# 而这个保护蛋白不一定是核糖体，还会有其他RNA结合蛋白。
+# 所有我们需要想办法区分这两种复合体（ribosome-RNA complexes & non-ribosomal protein-RNA complexes ）
+# 三种情况：1.translated ORFs；2. off-frame ORFs；3.non-ribsomal protein-RNA complexes.
+
+############################################### downloading #####################################################
+### annotations
+cd TMP/advanced_bioinfo/
+mkdir RibORF
+cd RibORF
+mkdir ano_v28
+cd ano_v28
+wget -c ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_28/gencode.v28.annotation.gtf.gz
+gunzip gencode.v28.annotation.gtf.gz
+
+## gtf ——> genPred
+gtfToGenePred gencode.v28.annotation.gtf gencode.v28.annotation.genePred.txt
+less gencode.v28.annotation.genePred.txt
+# noncoding RNA的翻译起始位点怎么表示？ 将转录终止位点作为翻译起始位点和终止位点
+# 例如转录区域为（11868,14409],则翻译区域写为(14409,14409]，长度为0
+# 1base和0base
+
+### genome fasta
+cd ..
+mkdir genome
+cd genome
+wget -c ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_28/GRCh38.primary_assembly.genome.fa.gz
+gunzip GRCh38.primary_assembly.genome.fa.gz
+
+### scripts
+# git已装
+git clone https://github.com/zhejilab/RibORF/
+## 加环境变量
+echo 'export PATH="/share/home/gust/TMP/advanced_bioinfo/RibORF/software/RibORF.2.0:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+### data fastq
+fastq-dump -Z SRR1802146 > data/SRR1802146.fastq
+
+######################### Run ORFannotate.pl and generate candidate ORFs in genePred format #############
+mkdir cddtORFs
+# perl ORFannotate.pl -g genome/GRCh38.primary_assembly.genome.fa -t ano_v28/gencode.v28.annotation.genePred.txt -o cddtORFs 为啥不行？
+# 加了环境后就不用在前面加“perl”了
+# 但可能系统不知道以什么方式来解读这个脚本，需要在头部声明“#!/usr/bin/perl”
+# 还要加上可执行权限
+chmod +x software/RibORF.2.0/*pl
+
+bsub -J ORFs -q normal -m fat01 -n 10 -e error1.log -o out1.log \
+ORFannotate.pl -g genome/GRCh38.primary_assembly.genome.fa -t ano_v28/gencode.v28.annotation.genePred.txt -o cddtORFs
+
+######################### remove 3'adapter ############################################
+bsub -J index -q normal -m fat01 -n 10 -e error3.log -o out3.log \
+removeAdapter.pl -f data/SRR1802146.fastq -a CTGTAGGCAC -o data/adapter.SRR1802146.fastq
+
+############################################ mapping ############################################
+### Map trimmed reads to rRNAs
+##  Get human rRNA sequences from NCBI database
+# 5S rRNA(NR_023363), 5.8S rRNA (NR_003285), 18S rRNA (NR_003286), 28S rRNA (NR_003287).
+mkdir -p genome/rRNA
+cd genome/rRNA
+# 手动下载fasta 再合并
+cat NR* > human.ribosomal.rna.fa
+
+## bowtie2 index
+cd ..
+cd ..
+mkdir -p index/rRNA_idx
+bsub -J index -q normal -m fat01 -n 10 -e error2.log -o out2.log \
+bowtie2-build genome/rRNA/human.ribosomal.rna.fa index/rRNA_idx/hg.ribosome
+
+## Align trimmed ribosome profiling reads from substep b to rRNAs, and obtain non-rRNA reads.
+bsub -J index -q normal -m fat01 -n 10 -e error4.log -o out4.log \
+bowtie2 -x index/rRNA_idx/hg.ribosome \
+-U data/adapter.SRR1802146.fastq \
+--un data/norrna.adapter.SRR1802146.fastq \
+-S data/ribosome.adapter.SRR1802146.fastq
+#-x 上一步build的index的前缀
+#-U 非双端测所对应的文件
+#--un 比对不上的序列以此名字输出
+#-S 比对上的
+
+### map non-rRNA reads to the reference transcriptome and genome
+mkdir align
+## tophat安装
+wget -c http://ccb.jhu.edu/software/tophat/downloads/tophat-2.1.0.Linux_x86_64.tar.gz
+mv tophat-2.1.0.Linux_x86_64.tar.gz /share/home/gust/TOOLS/
+echo 'export PATH="/share/home/gust/TOOLS/tophat-2.1.0.Linux_x86_64:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+## 更改为Python2路径
+whereis Python2
+# 打开tophat文件 头部声明改为“#!/usr/bin/python2.7”
+tophat -v
+tophat -h
+
+## GRCh38genome.index
+mkdir index/GRCh38_idx
+bsub -J index -q normal -m fat01 -n 10 -e error6.log -o out6.log \
+bowtie2-build genome/GRCh38.primary_assembly.genome.fa index/GRCh38_idx/GRCh38genome.index
+
+## mapping
+bsub -J mapping -q normal -m fat01 -n 10 -e error5.log -o out5.log \
+tophat --GTF ano_v28/gencode.v28.annotation.gtf \
+--no-convert-bam \
+-o ./align \
+index/GRCh38_idx/GRCh38genome.index \
+data/norrna.adapter.SRR1802146.fastq
+#--noconvert-bam  tophat默认输出格式是BAM，加上这个参数后让它输出SAM
+
+# 输出文件 accepted_hits.sam 改名为 SRR1802146.mapping.sam
+
+################################# Plot ribosome profiling read distribution ###############################
+##plot的是标准ORFs 如果标准ORFs能展现出比较好的3nt周期性，这说明这个测序数据是好的，后面的预测才会比较可信
+##后续把标准ORFs作为正向训练集
+
+mkdir readDist_res
+bsub -J readDist -q normal -m fat01 -n 10 -e error7.log -o out7.log \
+readDist.pl -f align/SRR1802146.mapping.sam \
+-g ano_v28/gencode.v28.annotation.genePred.txt \
+-o readDist_res \
+-d 28,29,30, \
+-l 40 \
+-r 70
+
+### check ribosome profiling data quality
+
+################################# Assign read mapping locations to ribosomal A-sites ########################
+mkdir offsetCorrect
+
+### generate the file offset.correction.parameters.txt
+touch offsetCorrect/offset.correction.parameters.txt
+vi offsetCorrect/offset.correction.parameters #进入vim编辑器
+i #输入模式
+#28	15 #问题的关键竟在于：中间是tab而非空格:(
+#29	16
+#30	16
+esc #退出编辑模式
+wq #保存并退出
+
+### run offsetCorrect.pl
+bsub -J correct -q normal -m fat01 -n 10 -e error8.log -o out8.log \
+offsetCorrect.pl -r align/SRR1802146.mapping.sam \
+-p offsetCorrect/offset.correction.parameters.txt \
+-o offsetCorrect/corrected.SRR1802146.mapping.sam
+
+### check: run readDist again
+mkdir readDist_res_2
+bsub -J correct -q normal -m fat01 -n 10 -e error10.log -o out10.log \
+readDist.pl -f offsetCorrect/corrected.SRR1802146.mapping.sam \
+-g ano_v28/gencode.v28.annotation.genePred.txt \
+-o readDist_res_2 \
+-d 1
+#√
+
+######################################## Run RibORF to identify translated ORFs ##################################
+mkdir ORFs
+bsub -J ORFs -q normal -m fat01 -n 10 -e error9.log -o out9.log \
+ribORF.pl -f offsetCorrect/corrected.SRR1802146.mapping.sam \
+-c cddtORFs/candidateORF.genepred.txt \
+-o ORFs
+
+###################################### R：Area Under ROC Curve (AUC) #########################################
+A <- read.table (“stat.cutoff.txt”, sep=“\t”,
+header=T)
+fpr <- A[,6]
+tpr <- A[,7]
+plot(fpr, tpr, col=0)
+lines(fpr, tpr,col=1, lwd=3)
+library(“MESS”)
+auc(fpr,tpr, type = ‘spline’)
+
+
+
+
+
+
+
+
+
+
